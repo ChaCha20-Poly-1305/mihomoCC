@@ -1,0 +1,516 @@
+#!/usr/bin/env bash
+# mihomo-ctl — start/stop wrapper for mihomo core on macOS
+
+set -euo pipefail
+
+# ── Configuration ────────────────────────────────────────────────────────────
+MIHOMO_BIN="${MIHOMO_BIN:-$(command -v mihomo 2>/dev/null || echo /opt/homebrew/bin/mihomo)}"
+MIHOMO_CFG_DIR="${MIHOMO_CFG_DIR:-$(eval echo ~${SUDO_USER:-$USER})/.config/mihomo}"
+MIHOMO_LOG="${MIHOMO_LOG:-/var/log/mihomo.log}"
+MIHOMO_PID_FILE="${MIHOMO_PID_FILE:-/var/run/mihomo.pid}"
+DNS_BACKUP_FILE="${DNS_BACKUP_FILE:-/var/run/mihomo-dns-backup}"
+MIHOMO_STATE_FILE="${MIHOMO_STATE_FILE:-/var/run/mihomo-state}"
+
+# Track whether PROXY_DNS was explicitly set in the environment before it's touched
+_PROXY_DNS_FROM_ENV="${PROXY_DNS+set}"
+PROXY_DNS="${PROXY_DNS:-}"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+require_root() {
+  [[ $EUID -eq 0 ]] || die "this command must be run as root (sudo mihomo-ctl $CMD)"
+}
+
+# Returns a newline-separated list of active network services
+active_services() {
+  networksetup -listallnetworkservices 2>/dev/null \
+    | tail -n +2 \
+    | grep -v '^\*'   # lines starting with * are disabled
+}
+
+# ── YAML helpers ──────────────────────────────────────────────────────────────
+
+# Get a value from within a named YAML block (handles quoted values)
+# Usage: yaml_block_get <file> <block-key> <sub-key>
+yaml_block_get() {
+  local file="$1" block="$2" key="$3"
+  awk -v block="$block" -v key="$key" '
+    /^[[:alpha:]]/ { in_block = ($1 == block":") }
+    in_block && /^[[:space:]]/ {
+      line = $0
+      gsub(/^[[:space:]]+/, "", line)
+      if (line ~ "^"key":") {
+        val = substr(line, length(key) + 2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        gsub(/^'"'"'|'"'"'$|^"|"$/, "", val)
+        print val
+        exit
+      }
+    }
+  ' "$file"
+}
+
+# Get a top-level YAML key value (handles quoted values)
+# Usage: yaml_get <file> <key>
+yaml_get() {
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    /^[^#[:space:]]/ && $1 == key":" {
+      val = substr($0, length(key) + 3)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      gsub(/^'"'"'|'"'"'$|^"|"$/, "", val)
+      print val
+      exit
+    }
+  ' "$file"
+}
+
+# ── Config parser ─────────────────────────────────────────────────────────────
+# Reads config.yaml and sets globals used by cmd_start / cmd_stop:
+#   _DNS_ENABLED       — true if DNS switching should happen
+#   _PROXY_DNS_RESOLVED — the IP to hand to set_dns
+#   _MIXED_PORT        — mixed-port value if tun.stack == mixed, else ""
+parse_config() {
+  local cfg_dir="$1"
+  local cfg_file="$cfg_dir/config.yaml"
+
+  _DNS_ENABLED=false
+  _PROXY_DNS_RESOLVED=""
+  _MIXED_PORT=""
+  _PROXY_TYPE=""
+
+  [[ -f "$cfg_file" ]] || { info "Config file not found — skipping auto-detection."; return; }
+
+  # ── DNS ───────────────────────────────────────────────────────────────────
+  if [[ "$_PROXY_DNS_FROM_ENV" == "set" ]]; then
+    # Env override wins unconditionally
+    _DNS_ENABLED=true
+    _PROXY_DNS_RESOLVED="$PROXY_DNS"
+    info "DNS: using env override $_PROXY_DNS_RESOLVED"
+  else
+    local dns_listen
+    dns_listen=$(yaml_block_get "$cfg_file" "dns" "listen")
+    if [[ -n "$dns_listen" ]]; then
+      local dns_ip dns_port
+      dns_ip="${dns_listen%%:*}"
+      dns_port="${dns_listen##*:}"
+      if [[ "$dns_port" == "53" ]]; then
+        # 0.0.0.0 means "all interfaces" — remap to loopback for system DNS
+        _PROXY_DNS_RESOLVED="${dns_ip/0.0.0.0/127.0.0.1}"
+        _DNS_ENABLED=true
+        info "DNS: detected listen $dns_listen → using $_PROXY_DNS_RESOLVED"
+      else
+        info "DNS: listen port is $dns_port (not 53) — skipping DNS switch."
+      fi
+    else
+      info "DNS: no listen address in config — skipping DNS switch."
+    fi
+  fi
+
+  # ── TUN / mixed-port ──────────────────────────────────────────────────────
+  local tun_enabled tun_stack mixed_port socks_port http_port
+
+  tun_enabled=$(yaml_block_get "$cfg_file" "tun" "enable")
+  tun_stack=$(yaml_block_get "$cfg_file" "tun" "stack")
+  mixed_port=$(yaml_get "$cfg_file" "mixed-port")
+  socks_port=$(yaml_get "$cfg_file" "socks-port")
+  http_port=$(yaml_get "$cfg_file" "port")   # bare HTTP proxy port in mihomo
+
+  [[ "$tun_enabled" == "true" ]] && tun_enabled=true || tun_enabled=false
+
+  if $tun_enabled && [[ "$tun_stack" == "mixed" ]] && [[ -n "$mixed_port" ]]; then
+    # TUN enabled, stack=mixed, mixed-port present → set all proxies
+    _MIXED_PORT="$mixed_port"
+    _PROXY_TYPE="mixed"
+    info "Proxy: TUN stack=mixed, port=$_MIXED_PORT"
+
+  elif ! $tun_enabled; then
+    # TUN disabled → use best available port, mixed takes priority
+    if [[ -n "$mixed_port" ]]; then
+      _MIXED_PORT="$mixed_port"; _PROXY_TYPE="mixed"
+      info "Proxy: TUN off, using mixed-port=$_MIXED_PORT"
+    elif [[ -n "$socks_port" ]]; then
+      _MIXED_PORT="$socks_port"; _PROXY_TYPE="socks"
+      info "Proxy: TUN off, using socks-port=$_MIXED_PORT"
+    elif [[ -n "$http_port" ]]; then
+      _MIXED_PORT="$http_port"; _PROXY_TYPE="http"
+      info "Proxy: TUN off, using http port=$_MIXED_PORT"
+    else
+      info "Proxy: TUN off but no proxy port found — skipping."
+    fi
+
+  else
+    # TUN enabled but stack≠mixed → don't touch system proxies
+    info "Proxy: TUN enabled (stack=${tun_stack:-unset}) — skipping proxy setup."
+  fi
+  
+  # Validate port is a number
+  [[ "$_MIXED_PORT" =~ ^[0-9]+$ ]] || _MIXED_PORT=""
+}
+
+# ── DNS helpers ───────────────────────────────────────────────────────────────
+save_dns() {
+  info "Saving current DNS settings…"
+  : > "$DNS_BACKUP_FILE"
+
+  while IFS= read -r svc; do
+    servers=$(networksetup -getdnsservers "$svc" 2>/dev/null || true)
+    printf '%s\t%s\n' "$svc" "$servers" >> "$DNS_BACKUP_FILE"
+  done < <(active_services)
+}
+
+set_dns() {
+  local target="$1"
+  info "Setting DNS to $target on all active interfaces…"
+
+  while IFS= read -r svc; do
+    networksetup -setdnsservers "$svc" "$target" 2>/dev/null \
+      && echo "  [ok] $svc" \
+      || echo "  [skip] $svc (may need elevated perms)"
+  done < <(active_services)
+}
+
+restore_dns() {
+  [[ -f "$DNS_BACKUP_FILE" ]] || { info "No DNS backup found — skipping restore."; return; }
+  info "Restoring original DNS settings…"
+
+  while IFS=$'\t' read -r svc servers; do
+    if echo "$servers" | grep -q "aren't any DNS Servers"; then
+      networksetup -setdnsservers "$svc" "Empty" 2>/dev/null \
+        && echo "  [ok] $svc → (DHCP)" \
+        || echo "  [skip] $svc"
+    else
+      # shellcheck disable=SC2086
+      networksetup -setdnsservers "$svc" $servers 2>/dev/null \
+        && echo "  [ok] $svc → $servers" \
+        || echo "  [skip] $svc"
+    fi
+  done < "$DNS_BACKUP_FILE"
+
+  rm -f "$DNS_BACKUP_FILE"
+}
+
+# ── System proxy helpers ──────────────────────────────────────────────────────
+set_system_proxy() {
+  local ip="$1" port="$2" type="${3:-mixed}"
+  info "Setting system proxy ($type) to $ip:$port on all active interfaces…"
+
+  while IFS= read -r svc; do
+    case "$type" in
+      mixed)
+        networksetup -setsocksfirewallproxy      "$svc" "$ip" "$port" off 2>/dev/null
+        networksetup -setsocksfirewallproxystate "$svc" on              2>/dev/null
+        networksetup -setwebproxy                "$svc" "$ip" "$port" off 2>/dev/null
+        networksetup -setwebproxystate           "$svc" on              2>/dev/null
+        networksetup -setsecurewebproxy          "$svc" "$ip" "$port" off 2>/dev/null
+        networksetup -setsecurewebproxystate     "$svc" on              2>/dev/null
+        ;;
+      socks)
+        networksetup -setsocksfirewallproxy      "$svc" "$ip" "$port" off 2>/dev/null
+        networksetup -setsocksfirewallproxystate "$svc" on              2>/dev/null
+        ;;
+      http)
+        networksetup -setwebproxy                "$svc" "$ip" "$port" off 2>/dev/null
+        networksetup -setwebproxystate           "$svc" on              2>/dev/null
+        networksetup -setsecurewebproxy          "$svc" "$ip" "$port" off 2>/dev/null
+        networksetup -setsecurewebproxystate     "$svc" on              2>/dev/null
+        ;;
+    esac
+    echo "  [ok] $svc"
+  done < <(active_services)
+}
+
+unset_system_proxy() {
+  local type="${1:-mixed}"
+  info "Disabling system proxy ($type) on all active interfaces…"
+
+  while IFS= read -r svc; do
+    case "$type" in
+      mixed)
+        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null
+        networksetup -setwebproxystate           "$svc" off 2>/dev/null
+        networksetup -setsecurewebproxystate     "$svc" off 2>/dev/null
+        ;;
+      socks)
+        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null
+        ;;
+      http)
+        networksetup -setwebproxystate           "$svc" off 2>/dev/null
+        networksetup -setsecurewebproxystate     "$svc" off 2>/dev/null
+        ;;
+    esac
+    echo "  [ok] $svc"
+  done < <(active_services)
+}
+# ── Commands ──────────────────────────────────────────────────────────────────
+cmd_start() {
+  require_root
+
+  local no_dns=false
+  local cfg_dir="$MIHOMO_CFG_DIR"
+
+  for arg in "$@"; do
+    case "$arg" in
+      -no-dns) no_dns=true ;;
+      *)       cfg_dir="$arg" ;;
+    esac
+  done
+
+  [[ -x "$MIHOMO_BIN" ]] || die "mihomo binary not found at $MIHOMO_BIN\n  Set MIHOMO_BIN to override."
+  [[ -d "$cfg_dir" ]]    || die "config directory not found: $cfg_dir"
+
+  if [[ -f "$MIHOMO_PID_FILE" ]]; then
+    local old_pid
+    old_pid=$(cat "$MIHOMO_PID_FILE")
+    if ps -p "$old_pid" > /dev/null 2>&1; then
+      die "mihomo is already running (PID $old_pid). Use 'mihomo-ctl stop' first."
+    else
+      info "Stale PID file found — cleaning up."
+      rm -f "$MIHOMO_PID_FILE"
+    fi
+  fi
+
+  parse_config "$cfg_dir"
+
+  # Persist what we're about to set so cmd_stop can undo exactly that
+  local state_dns
+  $no_dns && state_dns=false || state_dns="$_DNS_ENABLED"
+
+  if $no_dns; then
+    info "DNS switching disabled via -no-dns."
+  elif [[ "$_DNS_ENABLED" == true ]]; then
+    save_dns
+    set_dns "$_PROXY_DNS_RESOLVED"
+  fi
+
+  printf 'dns=%s\nproxy_port=%s\nproxy_type=%s\n' \
+    "$state_dns" "$_MIXED_PORT" "$_PROXY_TYPE" > "$MIHOMO_STATE_FILE"
+
+  if [[ -n "$_MIXED_PORT" ]]; then
+    set_system_proxy "127.0.0.1" "$_MIXED_PORT" "$_PROXY_TYPE"
+  fi
+
+  info "Launching mihomo (config: $cfg_dir)…"
+  nohup "$MIHOMO_BIN" -d "$cfg_dir" >> "$MIHOMO_LOG" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$MIHOMO_PID_FILE"
+
+  sleep 1
+  if ps -p "$pid" > /dev/null 2>&1; then
+    info "mihomo started (PID $pid). Log: $MIHOMO_LOG"
+  else
+    # Roll back anything we changed
+    if ! $no_dns && [[ "$_DNS_ENABLED" == true ]]; then restore_dns; fi
+    if [[ -n "$_MIXED_PORT" ]]; then unset_system_proxy "$_PROXY_TYPE"; fi
+    rm -f "$MIHOMO_PID_FILE" "$MIHOMO_STATE_FILE"
+    die "mihomo exited immediately — check $MIHOMO_LOG"
+  fi
+}
+
+cmd_stop() {
+  require_root
+
+  # Read back what cmd_start recorded so we undo only what was set
+  local state_dns=false state_proxy_port="" state_proxy_type="mixed"
+  if [[ -f "$MIHOMO_STATE_FILE" ]]; then
+    while IFS='=' read -r k v; do
+      case "$k" in
+        dns)        state_dns="$v" ;;
+        proxy_port) state_proxy_port="$v" ;;
+        proxy_type) state_proxy_type="$v" ;;
+      esac
+    done < "$MIHOMO_STATE_FILE"
+  fi
+
+  if [[ ! -f "$MIHOMO_PID_FILE" ]]; then
+    info "No PID file found. Checking for running process…"
+    local pid
+    pid=$(pgrep -x mihomo 2>/dev/null || true)
+    if [[ -z "$pid" ]]; then
+      info "mihomo does not appear to be running."
+    else
+      info "Found mihomo PID $pid (not started by this script) — killing."
+      kill "$pid" && info "Sent SIGTERM to $pid."
+    fi
+  else
+    local pid
+    pid=$(cat "$MIHOMO_PID_FILE")
+    if ps -p "$pid" > /dev/null 2>&1; then
+      info "Stopping mihomo (PID $pid)…"
+      kill "$pid"
+      for i in $(seq 1 5); do
+        ps -p "$pid" > /dev/null 2>&1 || break
+        sleep 1
+      done
+      if ps -p "$pid" > /dev/null 2>&1; then
+        info "Process still alive — sending SIGKILL."
+        kill -9 "$pid" || true
+      fi
+      info "mihomo stopped."
+    else
+      info "PID $pid is not running (stale PID file)."
+    fi
+    rm -f "$MIHOMO_PID_FILE"
+    truncate -s 0 "$MIHOMO_LOG"
+  fi
+
+  if [[ "$state_dns" == "true" ]]; then
+    restore_dns
+  else
+    info "DNS switching was not active — skipping restore."
+  fi
+
+  if [[ -n "$state_proxy_port" ]]; then
+    unset_system_proxy "$state_proxy_type"
+  fi
+
+  rm -f "$MIHOMO_STATE_FILE"
+}
+
+cmd_restart() {
+  local cfg_dir="${1:-$MIHOMO_CFG_DIR}"
+  info "Restarting mihomo…"
+  cmd_stop
+  cmd_start "$cfg_dir"
+}
+
+cmd_status() {
+  echo "── mihomo ──────────────────────────────"
+  if [[ -f "$MIHOMO_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$MIHOMO_PID_FILE")
+    if ps -p "$pid" > /dev/null 2>&1; then
+      echo "  status : running (PID $pid)"
+    else
+      echo "  status : stopped (stale PID file)"
+    fi
+  else
+    local pid
+    pid=$(pgrep -x mihomo 2>/dev/null || true)
+    if [[ -n "$pid" ]]; then
+      echo "  status : running (PID $pid, not managed by mihomo-ctl)"
+    else
+      echo "  status : stopped"
+    fi
+  fi
+
+  if [[ -f "$MIHOMO_STATE_FILE" ]]; then
+    echo ""
+    echo "── Active config ───────────────────────"
+    while IFS='=' read -r k v; do
+      case "$k" in
+        dns)        echo "  dns switching : $v" ;;
+        proxy_port) [[ -n "$v" ]] && echo "  system proxy  : 127.0.0.1:$v" || echo "  system proxy  : off" ;;
+      esac
+    done < "$MIHOMO_STATE_FILE"
+  fi
+
+  echo ""
+  echo "── DNS (active interfaces) ─────────────"
+  while IFS= read -r svc; do
+    local servers
+    servers=$(networksetup -getdnsservers "$svc" 2>/dev/null || echo "unknown")
+    printf '  %-30s %s\n' "$svc" "$servers"
+  done < <(active_services)
+}
+
+cmd_test() {
+  local cfg_dir="${1:-$MIHOMO_CFG_DIR}"
+  [[ -x "$MIHOMO_BIN" ]] || die "mihomo binary not found at $MIHOMO_BIN"
+  [[ -d "$cfg_dir" ]]    || die "config directory not found: $cfg_dir"
+
+  info "Validating config in $cfg_dir"
+  if "$MIHOMO_BIN" -t -d "$cfg_dir"; then
+    info "Config OK."
+  else
+    die "Config validation failed."
+  fi
+}
+
+cmd_edit() {
+  local cfg_dir="${1:-$MIHOMO_CFG_DIR}"
+  local cfg_file="$cfg_dir/config.yaml"
+  [[ -f "$cfg_file" ]] || die "config file not found: $cfg_file"
+
+  local editor="${EDITOR:-vim}"
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" "$editor" "$cfg_file"
+  else
+    "$editor" "$cfg_file"
+  fi
+}
+
+cmd_log() {
+  local follow=false
+  local log_file="$MIHOMO_LOG"
+
+  for arg in "$@"; do
+    case "$arg" in
+      -f) follow=true ;;
+      *)  log_file="$arg" ;;
+    esac
+  done
+
+  [[ -f "$log_file" ]] || die "log file not found: $log_file"
+
+  if $follow; then
+    tail -f "$log_file"
+  else
+    cat "$log_file"
+  fi
+}
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+Simple Mihomo core CLI wrapper for macOS with automatic DNS and proxy switching.
+Default config-dir: $MIHOMO_CFG_DIR
+
+Usage: $(basename "$0") <command> [options]
+
+Commands:
+  start   [-no-dns] [config-dir]   Start mihomo. DNS and TUN settings are
+                                   auto-detected from config.yaml unless
+                                   -no-dns is passed. Requires root.
+  stop                             Stop mihomo and restore DNS/proxy. Requires root.
+  restart [config-dir]             Stop then start. Requires root.
+  status                           Show process, DNS, and proxy status.
+  test    [config-dir]             Validate mihomo config.yaml
+  edit    [config-dir]             Open config.yaml for editing (default: vim)
+  log     [-f]                     Print log (-f to follow)
+
+Auto-detection (from config.yaml):
+  DNS switching   Enabled when dns.listen is present and port is 53.
+                  0.0.0.0 is remapped to 127.0.0.1 for system DNS.
+  System proxy    Set when tun.stack=mixed + mixed-port is defined, or when
+                  TUN is disabled and any of mixed-port/socks-port/port is
+                  defined. Not set when TUN is enabled with a non-mixed stack.
+
+Environment overrides:
+  PROXY_DNS            Force a specific DNS IP (skips config.yaml detection)
+  MIHOMO_BIN           Path to mihomo binary   (default: $MIHOMO_BIN)
+  MIHOMO_CFG_DIR       Config directory        (default: $MIHOMO_CFG_DIR)
+  MIHOMO_LOG           Log file                (default: $MIHOMO_LOG)
+  MIHOMO_PID_FILE      PID file                (default: $MIHOMO_PID_FILE)
+  DNS_BACKUP_FILE      DNS backup location     (default: $DNS_BACKUP_FILE)
+  MIHOMO_STATE_FILE    Runtime state file      (default: $MIHOMO_STATE_FILE)
+  EDITOR               Editor for 'edit'       (default: vim)
+EOF
+}
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  start)   cmd_start  "$@" ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart "$@" ;;
+  status)  cmd_status ;;
+  test)    cmd_test   "$@" ;;
+  edit)    cmd_edit   "$@" ;;
+  log)     cmd_log    "$@" ;;
+  help|--help|-h) usage ;;
+  *) echo "Unknown command: $CMD"; echo; usage; exit 1 ;;
+esac

@@ -1,0 +1,80 @@
+# Example configuration file for use with Mihomo and mihomo-ctl or mihomoCC. Ready for use - just add your rules and proxy servers.
+# Relies on remote DNS resolution of proxied queries to avoid DNS leaks.
+
+dns:
+  enable: true
+  respect-rules: false              # Do not enable with fake-ip
+  prefer-h3: false                  # DNS-over-QUIC. Can be enabled if your nameserver supports it
+  listen: '127.0.0.1:53'            # Local DNS listener on port 53, ready for use with network interfaces
+  enhanced-mode: fake-ip            # Returns fake IPs for DNS queries. DIRECT and PROXY rules decide whether to resolve locally or remotely.
+  fake-ip-ttl: 1                    # TTL for fake IPs. Usually doesn't need higher values than 1.
+  fake-ip-range: 198.18.0.0/16
+  fake-ip-filter-mode: blacklist    # Blacklisted rules will get real IPs, resolved through nameserver
+  fake-ip-filter:                   # Resolve real IPs for Apple system and LAN through nameserver
+    - rule-set:🍏 Apple
+    - rule-set:🏠 LAN
+  ipv6: false
+  default-nameserver:               # Resolve IPs for other nameservers. Must be a real IP or a URL with a real IP for DoH/DoT
+    - https://223.5.5.5/dns-query
+  nameserver:                       # Resolve IPs for domains in DIRECT rulesets and fake-ip-filter
+    - https://223.5.5.5/dns-query
+  fallback: []                      # Since proxied domains are resolved remotely, you're unlikely to need this
+
+tun:                                # Route all traffic through Mihomo
+  enable: true
+  stack: system                     # Can be set to gvisor, system, mixed. system is recommended. mixed requires mixed-port (default: 7890)
+  dns-hijack:                       # Hijack DNS queries system-wide and forward them to local listener
+    - any:53
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+  route-exclude-address:
+    - 192.168.0.0/16
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - fc00::/7
+
+# Zashboard (web UI for Mihomo, can be called from mihomoCC)
+external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+external-ui: ~/.config/mihomo/ui
+external-controller: 127.0.0.1:9090
+secret: ""
+
+proxy-groups:
+  - name: PROXYGROUP                # Proxy group template
+    type: select
+    interval: 86400
+    proxies:                        # Any proxies defined here can be selected from Zashboard (with a MATCH,PROXYGROUP rule) or defined in other rules
+      - "ProxyName"                 # Replace the placeholder with your actual proxy's name
+
+# Rulesets for blocking ads and routing Apple system and LAN directly
+rule-providers:
+  📢 Ads:
+    type: http
+    path: "./rules/ads.yaml"
+    url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Advertising/Advertising_Domain.yaml"
+    interval: 86400
+    behavior: domain
+    format: yaml
+
+  🍏 Apple:
+    type: http
+    path: "./rules/apple.yaml"
+    url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Apple/Apple_Classical_No_Resolve.yaml"
+    interval: 86400
+    behavior: classical
+    format: yaml
+
+  🏠 LAN:
+    type: http
+    path: "./rules/lan.yaml"
+    url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Lan/Lan_No_Resolve.yaml"
+    interval: 86400
+    behavior: classical
+    format: yaml
+
+rules:
+- RULE-SET,🏠 LAN,DIRECT
+- RULE-SET,🍏 Apple,DIRECT
+- RULE-SET,📢 Ads,REJECT
+- MATCH,PROXYGROUP
