@@ -10,7 +10,6 @@ struct StatusBarItemView: View {
     @ObservedObject var monitor: NetworkSpeedMonitor
     @ObservedObject var manager: MihomoManager
 
-    // Adjust both this and statusItem.length in AppDelegate together.
     private let totalWidth: CGFloat = 100
 
     var body: some View {
@@ -31,14 +30,12 @@ struct StatusBarItemView: View {
         .padding(.horizontal, 4)
     }
 
-    // Arrow sits in a fixed-width box so its position never drifts.
-    // The value+unit field is right-aligned in a fixed-width box so only
-    // the glyphs change — the arrow never moves as the number grows/shrinks.
     private func speedRow(text: String) -> some View {
         HStack(spacing: 2) {
             Text(text)
                 .font(.system(size: 9, weight: .regular, design: .default))
                 .frame(width: 53, alignment: .trailing) // value: right-aligned, fixed
+                .opacity(manager.isRunning ? 1.0 : 0.4)
         }
     }
 }
@@ -150,6 +147,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             popover.show(relativeTo: iconRect, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            // Drop focus so nothing is highlighted unless the user presses Tab
+            popover.contentViewController?.view.window?.makeFirstResponder(nil)
         }
     }
 }

@@ -4,11 +4,13 @@ struct PopoverView: View {
     @EnvironmentObject var manager: MihomoManager
     @EnvironmentObject var speed: NetworkSpeedMonitor
 
+    @State private var selectedProfile: String? = nil
+
     var body: some View {
         VStack(spacing: 0) {
 
             // ── On/off toggle + status ───────────────────────────────────
-            VStack(spacing: 6) {
+            VStack(spacing: 4) {
                 Toggle("", isOn: Binding(
                     get: { manager.isRunning },
                     set: { _ in manager.toggle() }
@@ -17,12 +19,64 @@ struct PopoverView: View {
                 .padding(.top, 14)
 
                 StatusRow(running: manager.isRunning, pid: manager.pid)
+
+                if manager.isRunning {
+                    ModeRow(
+                        tunActive:   manager.tunActive,
+                        tunStack:    manager.tunStack,
+                        proxyActive: manager.proxyActive,
+                        proxyPort:   manager.proxyPort,
+                        proxyType:   manager.proxyType
+                    )
+                }
             }
             .padding(.horizontal, 14)
 
+            // ── Profile picker (always shown) ────────────────────────────
+            Divider().padding(.vertical, 6)
+
+            if manager.profiles.isEmpty {
+                // No profiles — warn and offer to open the folder
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 11))
+                        .foregroundColor(.orange)
+                    Text("No profiles found")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button("Open Folder") { manager.openProfileFolder() }
+                        .font(.system(size: 11))
+                }
+                .padding(.horizontal, 14)
+            } else {
+                HStack {
+                    Text("Profile")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { selectedProfile ?? "" },
+                        set: { selectedProfile = $0.isEmpty ? nil : $0 }
+                    )) {
+                        ForEach(manager.profiles, id: \.self) { p in
+                            Text(p).tag(p)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(.system(size: 12))
+                    .frame(maxWidth: 150)
+                    .onChange(of: selectedProfile) { newVal in
+                        guard let name = newVal, name != manager.activeProfile else { return }
+                        manager.switchProfile(name)
+                    }
+                }
+                .padding(.horizontal, 14)
+            }
+
             Divider().padding(.vertical, 8)
 
-            // ── Settings + buttons ───────────────────────────────────────
+            // ── Settings ─────────────────────────────────────────────────
             VStack(alignment: .leading, spacing: 7) {
 
                 Toggle("No DNS Switching", isOn: $manager.noDns)
@@ -37,28 +91,37 @@ struct PopoverView: View {
 
                 Divider().padding(.vertical, 1)
 
-                HStack {
-                    Spacer()
-                    HStack(spacing: 4) {
-                        CtlButton("Log")    { manager.openLog()    }
-                        CtlButton("Config") { manager.openConfig() }
-                        CtlButton("Reload") { manager.reloadConfig() }
-                        if manager.hasWebUI {
-                            CtlButton("Web UI") { manager.openWebUI() }
-                        }
-                    }
-                    Spacer()
-                }
-            }
-            .padding(.bottom, 8)   // breathing room before the footer divider
+                // ── Button rows ───────────────────────────────────────────
+                VStack(spacing: 4) {
 
-            // ── Config changed banner ────────────────────────────────────
+                    // Row 1 — always present
+                    HStack(spacing: 4) {
+                        CtlButton("Log",    fullWidth: true) { manager.openLog()       }
+                        CtlButton("Config", fullWidth: true) { manager.openConfig()    }
+                        CtlButton("Reload", fullWidth: true) { manager.reloadProfile() }
+                    }
+
+                    // Row 2 — only when external-ui is detected
+                    if manager.hasWebUI {
+                        CtlButton("Open Web UI", fullWidth: true) { manager.openWebUI() }
+                    }
+
+                    // Row 3 — always present
+                    CtlButton("Open Profile Folder", fullWidth: true) {
+                        manager.openProfileFolder()
+                    }
+                }
+                .padding(.horizontal, 14)
+            }
+            .padding(.bottom, 8)
+
+            // ── Profile updated banner ───────────────────────────────────
             if manager.configChanged {
                 Divider()
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.clockwise.circle.fill")
                         .foregroundColor(.accentColor)
-                    Text("Config changed")
+                    Text("Profile updated")
                         .font(.system(size: 11))
                     Spacer()
                     Button("Restart") { manager.restart() }
@@ -114,6 +177,8 @@ struct PopoverView: View {
         }
         .frame(width: 250)
         .fixedSize(horizontal: false, vertical: true)
+        .onAppear { selectedProfile = manager.activeProfile }
+        .onChange(of: manager.activeProfile) { selectedProfile = $0 }
     }
 
     private func footerButton(
@@ -153,7 +218,38 @@ private struct StatusRow: View {
             .font(.system(size: 12))
             .foregroundColor(running ? .primary : .secondary)
         }
-        .padding(.bottom, 6)
+        .padding(.bottom, 2)
+    }
+}
+
+private struct ModeRow: View {
+    let tunActive:   Bool
+    let tunStack:    String
+    let proxyActive: Bool
+    let proxyPort:   String
+    let proxyType:   String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if tunActive {
+                modeTag(icon: "network",
+                        text: "TUN" + (tunStack.isEmpty ? "" : " · \(tunStack)"))
+            }
+            if proxyActive {
+                modeTag(icon: "arrow.triangle.2.circlepath",
+                        text: ":\(proxyPort)" +
+                              (proxyType.isEmpty || proxyType == "mixed" ? "" : " · \(proxyType)"))
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private func modeTag(icon: String, text: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 9))
+            Text(text).font(.system(size: 10))
+        }
+        .foregroundColor(.secondary)
     }
 }
 
@@ -196,10 +292,8 @@ private struct PillToggleStyle: ToggleStyle {
                     .shadow(radius: 1.5)
                     .frame(width: 24, height: 24)
                     .offset(x: configuration.isOn ? 18 : -18)
-                    .animation(
-                        .spring(response: 0.22, dampingFraction: 0.8),
-                        value: configuration.isOn
-                    )
+                    .animation(.spring(response: 0.22, dampingFraction: 0.8),
+                               value: configuration.isOn)
             }
         }
         .buttonStyle(.plain)
