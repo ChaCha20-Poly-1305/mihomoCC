@@ -1,5 +1,8 @@
-# Example configuration file for use with Mihomo and mihomo-ctl or mihomoCC. Ready for use - just add your rules and proxy servers.
+# Example configuration file for use with Mihomo and mihomo-ctl or mihomoCC for macOS.
 # Relies on remote DNS resolution of proxied queries to avoid DNS leaks.
+
+# This YAML only requires a valid proxy server to work. Refer to mihomo wiki on how to add one:
+# https://wiki.metacubex.one
 
 proxy-groups:
   - name: PROXYGROUP                # Proxy group template
@@ -12,7 +15,7 @@ dns:
   enable: true
   respect-rules: false              # Do not enable with fake-ip
   prefer-h3: false                  # DNS-over-QUIC. Can be enabled if your nameserver supports it
-  listen: '127.0.0.1:53'            # Local DNS listener on port 53. You can also define a real server IP (such as 223.5.5.5), but macOS may force some system queries to go there
+  listen: '127.0.0.1:53'            # Local DNS, must be on port 53. You can define a real DNS (such as 223.5.5.5), but macOS may force some system queries to go there
   enhanced-mode: fake-ip            # Returns fake IPs for DNS queries. DIRECT and PROXY rules decide whether to resolve locally or remotely
   fake-ip-ttl: 1                    # TTL for fake IPs. Usually doesn't need higher values than 1
   fake-ip-range: 198.18.0.0/16
@@ -21,7 +24,7 @@ dns:
     - rule-set:🍏 Apple
     - rule-set:🏠 LAN
   ipv6: false
-  default-nameserver:               # Resolve IPs for other nameservers. Must be a real IP or a URL with a real IP for DoH/DoT
+  default-nameserver:               # Resolve IPs for other nameservers. Must be a real IP or a URL containing a real IP (if you want DoH/DoT)
     - https://223.5.5.5/dns-query
   nameserver:                       # Resolve IPs for domains in DIRECT rulesets and fake-ip-filter
     - https://223.5.5.5/dns-query

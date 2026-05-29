@@ -40,18 +40,20 @@ Starting and stopping Mihomo is handled by mihomo-ctl (available in terminal). T
   <img src="./assets/diagram.png" alt="Diagram">
 </p>
 
-An example `config.yaml` with documented TUN, DNS and web UI blocks can be found in `templates` folder of this repo.
+A [YAML example](https://github.com/ChaCha20-Poly-1305/mihomoCC/blob/main/templates/config.yaml) is available.
 
 ## Popover
-**Profile picker:** mihomoCC creates `mihomo` folder in `~.config`, as well as `user-profiles` inside `mihomo`. It will read YAML files inside `user-profiles` and copy the chosen YAML as `~/.config/mihomo/config.yaml` for mihomo-ctl to pick up.
+**Profile picker:** mihomoCC creates `mihomo` folder in `~.config`, as well as `user-profiles` inside `mihomo`. It will read YAML files inside `user-profiles` and copy the active YAML as `~/.config/mihomo/config.yaml` for mihomo-ctl to pick up.
 
-**Web UI:** appears with `external-ui` defined in your chosen YAML. Opens a browser page on detected UI path.
+**Web UI:** appears with `external-ui` defined in your active YAML. Opens a browser page on detected UI path.
 
 **Log:** opens mihomo's real-time log in Console. 
 
-**Config:** opens your currently picked YAML in TextEdit. 
+**Config:** opens your active YAML in TextEdit. 
 
-**Reload:** forces a reload of chosen YAML and copies it to `~/.config/mihomo/config.yaml` - if changes are detected, mihomoCC will ask you to restart Mihomo.
+**Reload:** forces a reload of active YAML and copies it to `~/.config/mihomo/config.yaml`. If changes are detected, mihomoCC will ask you to restart Mihomo.
+
+**No DNS switching:** disables mihomo-ctl's DNS switching logic. Only use it if you know what you're doing - can cause a DNS leak when misused.
 
 mihomoCC will never start or stop Mihomo without user's explicit input.
 
@@ -61,7 +63,7 @@ mihomoCC will never start or stop Mihomo without user's explicit input.
 brew install mihomo
 ```
 2. Download the latest mihomoCC from Releases, unpack and run it. Enter your password to install the backend and add sudoers entry.
-3. Open your profiles folder and add your YAML files there. Make sure DNS, TUN and/or proxy ports are defined inside YAML.
+3. Open your profiles folder and add your YAML files there. Make sure DNS, TUN and/or proxy ports are defined inside YAML - refer to [YAML example](https://github.com/ChaCha20-Poly-1305/mihomoCC/blob/main/templates/config.yaml).
 
 ## Setup (advanced)
 1. Download a Mihomo binary for your Mac from Homebrew or its official [GitHub repo](https://github.com/MetaCubeX/mihomo.git) and make sure it's available in PATH.
@@ -73,12 +75,21 @@ install -m 755 mihomo-ctl /usr/local/bin/mihomo-ctl
 echo "%admin ALL=(ALL) NOPASSWD: /usr/local/bin/mihomo-ctl" > /etc/sudoers.d/mihomo-ctl
 chmod 440 /etc/sudoers.d/mihomo-ctl
 ```
-4. Copy your YAML files into `~/.config/mihomo/user-profiles`. If there isn't a TUN block or proxy port defined in the YAML you want to use, make sure to add it.
+4. Copy your YAML files into `~/.config/mihomo/user-profiles`. Make sure DNS, TUN and/or proxy ports are defined inside YAML.
 
 ## Uninstall
-Click "Uninstall" in the popover to remove mihomo-ctl and sudoers entry (will require your password). Click "Quit" and drag the app to Trash. This will not uninstall Mihomo itself - only the app and its backend.
+1. Click "Uninstall" in the popover to remove mihomo-ctl and sudoers entry (will require your password), OR quit mihomoCC and run these commands as root: 
+```
+rm /usr/local/bin/mihomo-ctl
+rm /etc/sudoers.d/mihomo-ctl
+```
+2. Drag mihomoCC to Trash. This will not remove your YAML files or Mihomo itself - only the app and its backend.
 
 ### Troubleshooting
 mihomoCC has basic safeguards to revert network interface adjustments on shutdown, but they won't necessarily cover cases of OS crashing. If your network stops working with Mihomo and mihomoCC disabled, check your network interface settings and make sure your DNS isn't set to 127.0.0.1 or a bogus IP and proxies are disabled.
 
 mihomoCC is designed to avoid introducing points of failure. If your proxy doesn't work correctly, the problem will almost certainly be tied to your YAML or Mihomo itself - before opening an issue, make sure you can't reproduce your problem without the app.
+
+## Acknowledgements
+- [mihomo](https://github.com/MetaCubeX/mihomo)
+- [Zashboard](https://github.com/Zephyruso/zashboard)

@@ -80,6 +80,8 @@ parse_config() {
   _PROXY_DNS_RESOLVED=""
   _MIXED_PORT=""
   _PROXY_TYPE=""
+  _TUN_ENABLED=false
+  _TUN_STACK=""
 
   [[ -f "$cfg_file" ]] || { info "Config file not found — skipping auto-detection."; return; }
 
@@ -119,6 +121,8 @@ parse_config() {
   http_port=$(yaml_get "$cfg_file" "port")   # bare HTTP proxy port in mihomo
 
   [[ "$tun_enabled" == "true" ]] && tun_enabled=true || tun_enabled=false
+  $tun_enabled && _TUN_ENABLED=true || _TUN_ENABLED=false
+  _TUN_STACK="${tun_stack:-}"
 
   if $tun_enabled && [[ "$tun_stack" == "mixed" ]] && [[ -n "$mixed_port" ]]; then
     # TUN enabled, stack=mixed, mixed-port present → set all proxies
@@ -285,8 +289,8 @@ cmd_start() {
     set_dns "$_PROXY_DNS_RESOLVED"
   fi
 
-  printf 'dns=%s\nproxy_port=%s\nproxy_type=%s\n' \
-    "$state_dns" "$_MIXED_PORT" "$_PROXY_TYPE" > "$MIHOMO_STATE_FILE"
+  printf 'dns=%s\nproxy_port=%s\nproxy_type=%s\ntun_active=%s\ntun_stack=%s\n' \
+    "$state_dns" "$_MIXED_PORT" "$_PROXY_TYPE" "$_TUN_ENABLED" "$_TUN_STACK" > "$MIHOMO_STATE_FILE"
 
   if [[ -n "$_MIXED_PORT" ]]; then
     set_system_proxy "127.0.0.1" "$_MIXED_PORT" "$_PROXY_TYPE"
@@ -399,12 +403,32 @@ cmd_status() {
   if [[ -f "$MIHOMO_STATE_FILE" ]]; then
     echo ""
     echo "── Active config ───────────────────────"
+    local st_dns="" st_proxy_port="" st_proxy_type="" st_tun_active="" st_tun_stack=""
     while IFS='=' read -r k v; do
       case "$k" in
-        dns)        echo "  dns switching : $v" ;;
-        proxy_port) [[ -n "$v" ]] && echo "  system proxy  : 127.0.0.1:$v" || echo "  system proxy  : off" ;;
+        dns)        st_dns="$v" ;;
+        proxy_port) st_proxy_port="$v" ;;
+        proxy_type) st_proxy_type="$v" ;;
+        tun_active) st_tun_active="$v" ;;
+        tun_stack)  st_tun_stack="$v" ;;
       esac
     done < "$MIHOMO_STATE_FILE"
+
+    if [[ "$st_tun_active" == "true" ]]; then
+      if [[ -n "$st_tun_stack" ]]; then
+        echo "  tun        : active (stack: $st_tun_stack)"
+      else
+        echo "  tun        : active"
+      fi
+    else
+      echo "  tun        : inactive"
+    fi
+
+    if [[ -n "$st_proxy_port" ]]; then
+      echo "  proxy      : 127.0.0.1:$st_proxy_port ($st_proxy_type)"
+    else
+      echo "  proxy      : off"
+    fi
   fi
 
   echo ""
